@@ -1,6 +1,88 @@
 <?xml version="1.0" encoding="utf-8"?>
 <search>
   <entry>
+    <title>PostgreSQL问题排查</title>
+    <url>/2025/07/20/Postgre/</url>
+    <content><![CDATA[<h2 id="一、问题描述"><a href="#一、问题描述" class="headerlink" title="一、问题描述"></a>一、问题描述</h2><ul>
+<li>在执行以下 SQL 语句时，长时间无响应：</li>
+</ul>
+<figure class="highlight sql"><table><tr><td class="code"><pre><span class="line"><span class="keyword">ALTER TABLE</span> public.xx <span class="keyword">DROP</span> <span class="keyword">COLUMN</span> xx;</span><br></pre></td></tr></table></figure>
+<p>该表数据量并不大（仅 1569 条），但执行 <code>ALTER TABLE DROP COLUMN</code> 却迟迟不返回，怀疑被锁或存在阻塞。</p>
+<h2 id="二、排查过程"><a href="#二、排查过程" class="headerlink" title="二、排查过程"></a>二、排查过程</h2><p>我们使用如下 SQL 查询 PostgreSQL 中的锁等待情况：</p>
+<figure class="highlight sql"><table><tr><td class="code"><pre><span class="line"><span class="keyword">SELECT</span></span><br><span class="line">    l.pid,</span><br><span class="line">    a.usename,</span><br><span class="line">    l.mode,</span><br><span class="line">    l.granted,</span><br><span class="line">    a.query,</span><br><span class="line">    a.state,</span><br><span class="line">    a.wait_event_type,</span><br><span class="line">    a.wait_event</span><br><span class="line"><span class="keyword">FROM</span> pg_locks l</span><br><span class="line"><span class="keyword">JOIN</span> pg_stat_activity a <span class="keyword">ON</span> l.pid <span class="operator">=</span> a.pid</span><br><span class="line"><span class="keyword">WHERE</span> l.relation <span class="operator">=</span> <span class="string">&#x27;xx&#x27;</span>::regclass;</span><br></pre></td></tr></table></figure>
+
+<h3 id="查询结果分析："><a href="#查询结果分析：" class="headerlink" title="查询结果分析："></a>查询结果分析：</h3><ul>
+<li><code>granted = false</code>：说明该会话<strong>正在等待获取锁</strong>；</li>
+<li>发现 <code>ALTER TABLE</code> 的语句没有成功获取锁；</li>
+<li>同时存在其他几个 <code>SELECT</code> 语句，它们被包裹在显式事务（<code>BEGIN</code>）中，这些事务<strong>持有了<code>ACCESS SHARE</code>共享锁</strong>；</li>
+<li>这些共享锁阻止了 <code>ALTER TABLE</code> 所需的**排他锁（<code>ACCESS EXCLUSIVE</code>）**获取。</li>
+</ul>
+<hr>
+<h2 id="三、锁机制原理（简要）"><a href="#三、锁机制原理（简要）" class="headerlink" title="三、锁机制原理（简要）"></a>三、锁机制原理（简要）</h2><p>PostgreSQL 对表操作有精细的锁等级划分，具体如下：</p>
+<table>
+<thead>
+<tr>
+<th>操作类型</th>
+<th>锁类型（Lock Mode）</th>
+<th>是否阻塞其他操作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SELECT</code></td>
+<td><code>ACCESS SHARE</code></td>
+<td>与大多数操作兼容</td>
+</tr>
+<tr>
+<td><code>SELECT FOR UPDATE</code></td>
+<td><code>ROW SHARE</code></td>
+<td>允许部分写操作</td>
+</tr>
+<tr>
+<td><code>INSERT/UPDATE/DELETE</code></td>
+<td><code>ROW EXCLUSIVE</code></td>
+<td>允许并发读</td>
+</tr>
+<tr>
+<td><code>ALTER TABLE</code></td>
+<td><code>ACCESS EXCLUSIVE</code></td>
+<td>阻塞所有其他锁</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>重点：<code>ALTER TABLE</code> 需要 <code>ACCESS EXCLUSIVE</code> 锁，会阻塞其他任何访问该表的事务。</strong></p>
+</blockquote>
+<h3 id="🔒-为什么会阻塞？"><a href="#🔒-为什么会阻塞？" class="headerlink" title="🔒 为什么会阻塞？"></a>🔒 为什么会阻塞？</h3><p>因为其他事务中存在显式或隐式 <code>BEGIN</code>，即使只是 <code>SELECT</code>，一旦在事务未提交前执行，PostgreSQL 仍然会维持共享锁（<code>ACCESS SHARE</code>），从而阻止结构变更。</p>
+<hr>
+<h2 id="四、解决方案"><a href="#四、解决方案" class="headerlink" title="四、解决方案"></a>四、解决方案</h2><h3 id="✅-确认持有锁的会话"><a href="#✅-确认持有锁的会话" class="headerlink" title="✅ 确认持有锁的会话"></a>✅ 确认持有锁的会话</h3><p>为了更直观查看“谁阻塞了谁”，使用以下 SQL 查看阻塞链</p>
+<figure class="highlight sql"><table><tr><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> blocked_locks.pid     <span class="keyword">AS</span> blocked_pid,</span><br><span class="line">       blocked_activity.query <span class="keyword">AS</span> blocked_query,</span><br><span class="line">       blocking_locks.pid     <span class="keyword">AS</span> blocking_pid,</span><br><span class="line">       blocking_activity.query <span class="keyword">AS</span> blocking_query</span><br><span class="line"><span class="keyword">FROM</span> pg_locks blocked_locks</span><br><span class="line"><span class="keyword">JOIN</span> pg_stat_activity blocked_activity <span class="keyword">ON</span> blocked_activity.pid <span class="operator">=</span> blocked_locks.pid</span><br><span class="line"><span class="keyword">JOIN</span> pg_locks blocking_locks <span class="keyword">ON</span> blocking_locks.locktype <span class="operator">=</span> blocked_locks.locktype</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.database <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.database</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.relation <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.relation</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.page <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.page</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.tuple <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.tuple</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.virtualxid <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.virtualxid</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.transactionid <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.transactionid</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.classid <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.classid</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.objid <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.objid</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.objsubid <span class="keyword">IS</span> <span class="keyword">NOT</span> <span class="keyword">DISTINCT</span> <span class="keyword">FROM</span> blocked_locks.objsubid</span><br><span class="line">  <span class="keyword">AND</span> blocking_locks.pid <span class="operator">!=</span> blocked_locks.pid</span><br><span class="line"><span class="keyword">JOIN</span> pg_stat_activity blocking_activity <span class="keyword">ON</span> blocking_activity.pid <span class="operator">=</span> blocking_locks.pid;</span><br></pre></td></tr></table></figure>
+
+<h3 id="✅-清理阻塞源"><a href="#✅-清理阻塞源" class="headerlink" title="✅ 清理阻塞源"></a>✅ 清理阻塞源</h3><ul>
+<li><strong>方式一</strong>：联系对应业务方，确认是否存在未提交的长事务；</li>
+<li><strong>方式二</strong>：通过 <code>pg_terminate_backend(pid)</code> 强制终止对应进程（⚠️ 有风险）；</li>
+<li><strong>方式三</strong>：等待事务自动提交（若业务最终会提交）；</li>
+<li><strong>方式四</strong>：业务代码中避免 <code>SELECT</code> 后长时间不提交事务。</li>
+</ul>
+<hr>
+<h2 id="五、优化建议"><a href="#五、优化建议" class="headerlink" title="五、优化建议"></a>五、优化建议</h2><ol>
+<li><strong>DDL 操作建议在低峰期执行</strong>，避免业务高并发时影响；</li>
+<li><strong>SELECT 不要在事务中长时间挂起</strong>，避免持锁；</li>
+<li>使用 <code>LOCK TABLE table_name IN ACCESS EXCLUSIVE MODE</code> 预演锁，观察是否能立即获得锁；</li>
+<li>利用 <code>pg_stat_activity</code> 和 <code>pg_locks</code> 实时监控系统的锁竞争；</li>
+<li>若为频繁执行的 DDL 操作，考虑分库分表设计或提前下线服务窗口。</li>
+</ol>
+<hr>
+<h2 id="六、总结"><a href="#六、总结" class="headerlink" title="六、总结"></a>六、总结</h2><p>虽然表数据量不大，但结构变更涉及的锁粒度很大，任何未提交的事务中对目标表的访问都会阻塞掉 DDL 操作</p>
+]]></content>
+      <categories>
+        <category>SQL</category>
+      </categories>
+      <tags>
+        <tag>PostgreSQL</tag>
+        <tag>锁表</tag>
+        <tag>SQL优化</tag>
+      </tags>
+  </entry>
+  <entry>
     <title>Hello World</title>
     <url>/2025/07/05/hello-world/</url>
     <content><![CDATA[<p>Welcome to <a href="https://hexo.io/">Hexo</a>! This is your very first post. Check <a href="https://hexo.io/docs/">documentation</a> for more info. If you get any problems when using Hexo, you can find the answer in <a href="https://hexo.io/docs/troubleshooting.html">troubleshooting</a> or you can ask me on <a href="https://github.com/hexojs/hexo/issues">GitHub</a>.</p>
